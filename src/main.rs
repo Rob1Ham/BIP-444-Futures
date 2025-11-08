@@ -1,13 +1,19 @@
 //! # Bitcoin Taproot Futures Contract
 //!
 //! Trustless speculation on BIP 444 UASF activation. BIP 444 makes OP_IF/OP_NOTIF
-//! consensus-invalid in Taproot scripts. Leaf 1 contains these opcodes and becomes
-//! unspendable if BIP 444 activates (YES wins). Leaf 2 remains valid (YES fallback).
+//! consensus-invalid in Taproot scripts.
 //!
-//! Spending paths:
-//! - Leaf 1 Path A: 2-of-2 multisig (presigned settlement)
-//! - Leaf 1 Path B: NO_ALT + after(100) - NO wins if BIP 444 fails
-//! - Leaf 2: YES + after(200) - YES wins if BIP 444 activates
+//! ## Spending paths (all demonstrated):
+//! - **Leaf 3**: Simple 2-of-2 multisig - **Refresh transaction path**
+//!   - Bypasses BIP 444 grandfather clause (UTXOs before activation exempt)
+//!   - Creates fresh UTXO subject to BIP 444 rules after activation
+//! - **Leaf 1 Path B**: NO_ALT + after(100) - Contains OP_IF, invalid if BIP 444 activates
+//! - **Leaf 2**: YES + after(200) - No OP_IF, remains valid regardless of BIP 444
+//!
+//! ## Settlement Logic:
+//! - **If BIP 444 activates**: Leaf 1 becomes unspendable → YES wins via Leaf 2
+//! - **If BIP 444 fails**: NO spends via Leaf 1 before YES timelock
+//! - **Refresh transaction**: Both parties use Leaf 3 to create fresh UTXO (avoids grandfather exemption)
 //!
 //! Uses NUMS point internal key to enforce script-path spending only.
 
@@ -126,7 +132,15 @@ impl Party {
     }
 }
 
-/// Taproot contract: Leaf 1 (multisig OR NO+timelock), Leaf 2 (YES+timelock)
+/// Taproot contract with three leaves for BIP 444 futures speculation
+///
+/// - **Leaf 1**: `or(and(YES,NO), and(NO_ALT,after(100)))` - Contains OP_IF, invalid if BIP 444 activates
+/// - **Leaf 2**: `and(YES,after(200))` - No OP_IF, YES fallback if BIP 444 activates
+/// - **Leaf 3**: `and(YES,NO)` - Simple 2-of-2 for "refresh" transaction (avoids grandfather clause)
+///
+/// Leaf 3 is critical: BIP 444's grandfather clause exempts UTXOs created before activation.
+/// The 2-of-2 multisig allows cooperative refresh after BIP 444 activates, creating a fresh
+/// UTXO subject to the new consensus rules.
 #[allow(dead_code)]
 struct Contract {
     address: Address,
@@ -134,6 +148,7 @@ struct Contract {
     spend_info: TaprootSpendInfo,
     leaf1_script: ScriptBuf,
     leaf2_script: ScriptBuf,
+    leaf3_script: ScriptBuf,
 }
 
 /// BDK wallets for different spending paths (production would use PSBTs)
@@ -177,6 +192,7 @@ impl SigningWallets {
             yes_pk, no_pk, no_alt_pk, NO_SPEND_HEIGHT
         );
         let leaf2_policy_str = format!("and(pk({}),after({}))", yes_pk, YES_SPEND_HEIGHT);
+        let leaf3_policy_str = format!("and(pk({}),pk({}))", yes_pk, no_pk);
 
         let leaf1_policy: Concrete<XOnlyPublicKey> = leaf1_policy_str.parse()?;
         let leaf1_miniscript: Miniscript<XOnlyPublicKey, Tap> = leaf1_policy.compile()?;
@@ -184,15 +200,21 @@ impl SigningWallets {
         let leaf2_policy: Concrete<XOnlyPublicKey> = leaf2_policy_str.parse()?;
         let leaf2_miniscript: Miniscript<XOnlyPublicKey, Tap> = leaf2_policy.compile()?;
 
+        let leaf3_policy: Concrete<XOnlyPublicKey> = leaf3_policy_str.parse()?;
+        let leaf3_miniscript: Miniscript<XOnlyPublicKey, Tap> = leaf3_policy.compile()?;
+
         let leaf1_ms_str = leaf1_miniscript.to_string();
         let leaf2_ms_str = leaf2_miniscript.to_string();
+        let leaf3_ms_str = leaf3_miniscript.to_string();
 
         let change_desc = format!("tr({})", NUMS_POINT);
 
         // YES-only wallet (has YES private key)
         let yes_only_leaf1 = leaf1_ms_str.clone();
         let yes_only_leaf2 = leaf2_ms_str.replace(&yes_pk.to_string(), &yes_derived.to_string());
-        let yes_only_desc = format!("tr({},{{{},{}}})", NUMS_POINT, yes_only_leaf1, yes_only_leaf2);
+        let yes_only_leaf3 = leaf3_ms_str.clone();
+        let yes_only_desc = format!("tr({},{{{}{}{{{}{}{}}}}})",
+            NUMS_POINT, yes_only_leaf3, ',', yes_only_leaf1, ',', yes_only_leaf2);
         let yes_only = Wallet::create(yes_only_desc, change_desc.clone())
             .network(SIGNET_NETWORK)
             .create_wallet_no_persist()?;
@@ -201,7 +223,9 @@ impl SigningWallets {
         let no_only_leaf1 = leaf1_ms_str
             .replace(&no_alt_pk.to_string(), &no_alt_derived.to_string());
         let no_only_leaf2 = leaf2_ms_str.clone();
-        let no_only_desc = format!("tr({},{{{},{}}})", NUMS_POINT, no_only_leaf1, no_only_leaf2);
+        let no_only_leaf3 = leaf3_ms_str.clone();
+        let no_only_desc = format!("tr({},{{{}{}{{{}{}{}}}}})",
+            NUMS_POINT, no_only_leaf3, ',', no_only_leaf1, ',', no_only_leaf2);
         let no_only = Wallet::create(no_only_desc, change_desc.clone())
             .network(SIGNET_NETWORK)
             .create_wallet_no_persist()?;
@@ -212,7 +236,11 @@ impl SigningWallets {
             .replace(&no_pk.to_string(), &no_derived.to_string())
             .replace(&no_alt_pk.to_string(), &no_alt_derived.to_string());
         let multisig_leaf2 = leaf2_ms_str.replace(&yes_pk.to_string(), &yes_derived.to_string());
-        let multisig_desc = format!("tr({},{{{},{}}})", NUMS_POINT, multisig_leaf1, multisig_leaf2);
+        let multisig_leaf3 = leaf3_ms_str
+            .replace(&yes_pk.to_string(), &yes_derived.to_string())
+            .replace(&no_pk.to_string(), &no_derived.to_string());
+        let multisig_desc = format!("tr({},{{{}{}{{{}{}{}}}}})",
+            NUMS_POINT, multisig_leaf3, ',', multisig_leaf1, ',', multisig_leaf2);
         let multisig = Wallet::create(multisig_desc, change_desc)
             .network(SIGNET_NETWORK)
             .create_wallet_no_persist()?;
@@ -231,10 +259,16 @@ impl SigningWallets {
 }
 
 impl Contract {
-    /// Creates Taproot contract with two leaves and NUMS internal key
+    /// Creates Taproot contract with three leaves and NUMS internal key
     ///
-    /// BIP 444 futures contract: Leaf 1 contains OR (compiles to OP_IF) which becomes
-    /// consensus-invalid if BIP 444 activates. Leaf 2 has no conditionals, remains valid.
+    /// BIP 444 futures contract with refresh capability:
+    /// - **Leaf 1**: Contains OR (compiles to OP_IF), becomes invalid if BIP 444 activates
+    /// - **Leaf 2**: Simple AND, no conditionals, remains valid (YES fallback)
+    /// - **Leaf 3**: Simple 2-of-2 AND, enables "refresh" transaction to bypass grandfather clause
+    ///
+    /// Leaf 3 is essential for BIP 444's grandfather clause: UTXOs existing before activation
+    /// are exempt from new rules. The cooperative 2-of-2 allows parties to refresh the UTXO
+    /// after activation, creating a fresh UTXO subject to BIP 444 consensus rules.
     fn new(yes_pk: XOnlyPublicKey, no_pk: XOnlyPublicKey, no_alt_pk: XOnlyPublicKey) -> Result<Self, Box<dyn std::error::Error>> {
         let secp = Secp256k1::new();
 
@@ -245,9 +279,12 @@ impl Contract {
         );
         // Leaf 2: No conditional opcodes (remains valid under BIP 444)
         let leaf2_policy_str = format!("and(pk({}),after({}))", yes_pk, YES_SPEND_HEIGHT);
+        // Leaf 3: Simple 2-of-2 multisig, no timelock (cooperative exit path)
+        let leaf3_policy_str = format!("and(pk({}),pk({}))", yes_pk, no_pk);
 
         println!("Leaf 1 Policy: {}", leaf1_policy_str);
         println!("Leaf 2 Policy: {}", leaf2_policy_str);
+        println!("Leaf 3 Policy: {}", leaf3_policy_str);
 
         let leaf1_policy: Concrete<XOnlyPublicKey> = leaf1_policy_str.parse()?;
         let leaf1_miniscript: Miniscript<XOnlyPublicKey, Tap> = leaf1_policy.compile()?;
@@ -257,23 +294,32 @@ impl Contract {
         let leaf2_miniscript: Miniscript<XOnlyPublicKey, Tap> = leaf2_policy.compile()?;
         let leaf2_script = leaf2_miniscript.encode();
 
+        let leaf3_policy: Concrete<XOnlyPublicKey> = leaf3_policy_str.parse()?;
+        let leaf3_miniscript: Miniscript<XOnlyPublicKey, Tap> = leaf3_policy.compile()?;
+        let leaf3_script = leaf3_miniscript.encode();
+
         println!("\nLeaf 1 Miniscript: {}", leaf1_miniscript);
         println!("Leaf 2 Miniscript: {}", leaf2_miniscript);
+        println!("Leaf 3 Miniscript: {}", leaf3_miniscript);
 
         let nums_pk = XOnlyPublicKey::from_str(NUMS_POINT)?;
         let taproot_builder = TaprootBuilder::new()
-            .add_leaf(1, leaf1_script.clone())?
-            .add_leaf(1, leaf2_script.clone())?;
+            .add_leaf(2, leaf1_script.clone())?
+            .add_leaf(2, leaf2_script.clone())?
+            .add_leaf(1, leaf3_script.clone())?;
 
         let spend_info = taproot_builder.finalize(&secp, nums_pk)
             .map_err(|e| format!("Taproot finalize failed: {:?}", e))?;
 
         let address = Address::p2tr_tweaked(spend_info.output_key(), SIGNET_NETWORK);
 
-        let descriptor_str = format!(
-            "tr({},{{{},{}}})",
+        // BDK descriptor matching tree structure: {leaf3,{leaf1,leaf2}}
+        let descriptor_str = format!("tr({},{{{}{}{{{}{}{}}}}})",
             NUMS_POINT,
+            leaf3_miniscript,
+            ',',
             leaf1_miniscript,
+            ',',
             leaf2_miniscript
         );
         println!("\nDescriptor: {}", descriptor_str);
@@ -284,6 +330,7 @@ impl Contract {
         println!("Leaf 1 - Path A (Multisig): pk(YES) AND pk(NO)");
         println!("Leaf 1 - Path B (Timelock): pk(NO_ALT) AND after({})", NO_SPEND_HEIGHT);
         println!("Leaf 2 (YES Timelock): pk(YES) AND after({})", YES_SPEND_HEIGHT);
+        println!("Leaf 3 (Cooperative): pk(YES) AND pk(NO) [no timelock]");
 
         Ok(Contract {
             address,
@@ -291,6 +338,7 @@ impl Contract {
             spend_info,
             leaf1_script,
             leaf2_script,
+            leaf3_script,
         })
     }
 }
@@ -372,6 +420,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  NO alt pubkey: {}", no_party.alt_pubkey.unwrap());
 
     // ═══ STEP 2: CREATE CONTRACT ═══
+    // Creates 3-leaf Taproot tree:
+    // - Leaf 1 (depth 2): OR structure with OP_IF (invalid if BIP 444 activates)
+    // - Leaf 2 (depth 2): YES timelock fallback
+    // - Leaf 3 (depth 1): Cooperative 2-of-2 exit (most efficient path)
     println!("\nStep 2: Creating taproot contract...");
     let contract = Contract::new(
         yes_party.pubkey,
@@ -511,10 +563,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nWaiting for contract UTXO...");
     thread::sleep(Duration::from_secs(10));
 
-    // ═══ STEP 5: MULTISIG SPEND (Leaf 1 Path A) ═══
-    // Self-send simulates BIP 444 grandfather clause (UTXOs before activation exempt)
-    println!("\nStep 5: Self-send transaction (multisig leaf)...");
-    println!("└─ Using: Multisig Signing Wallet (Leaf 1 Path A)");
+    // ═══ STEP 5: REFRESH TRANSACTION (Leaf 3 - Simple 2-of-2) ═══
+    // Demonstrates "refresh" transaction to bypass BIP 444 grandfather clause
+    // BIP 444 exempts UTXOs created before activation. This cooperative 2-of-2 spend
+    // creates a fresh UTXO that WILL be subject to BIP 444 rules if activated.
+    // Uses Leaf 3: simple and(YES,NO) with no conditionals (most efficient path)
+    println!("\nStep 5: Refresh transaction (Leaf 3 - bypasses grandfather clause)...");
+    println!("└─ Using: Leaf 3 (Simple 2-of-2, no OP_IF, no timelock)");
+    println!("└─ Purpose: Create fresh UTXO subject to BIP 444 rules");
 
     let utxo_value = output_amount;
     let vout = 0u32;
@@ -541,7 +597,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output: vec![output],
     };
 
-    // Sign with script-path (untweaked keys, requires control block)
+    // Sign with Leaf 3 (simple cooperative multisig)
     {
         let prevout = TxOut {
             value: Amount::from_sat(utxo_value),
@@ -551,10 +607,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sighash_cache = SighashCache::new(&mut self_send_tx);
 
         let control_block = contract.spend_info
-            .control_block(&(contract.leaf1_script.clone(), LeafVersion::TapScript))
+            .control_block(&(contract.leaf3_script.clone(), LeafVersion::TapScript))
             .expect("control block");
 
-        let leaf_hash = TapLeafHash::from_script(&contract.leaf1_script, LeafVersion::TapScript);
+        let leaf_hash = TapLeafHash::from_script(&contract.leaf3_script, LeafVersion::TapScript);
 
         let sighash = sighash_cache.taproot_script_spend_signature_hash(
             0, &prevouts, leaf_hash, TapSighashType::Default
@@ -567,17 +623,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut witness = Witness::new();
         witness.push(sig_no.as_ref());
         witness.push(sig_yes.as_ref());
-        witness.push(contract.leaf1_script.as_bytes());
+        witness.push(contract.leaf3_script.as_bytes());
         witness.push(control_block.serialize());
         self_send_tx.input[0].witness = witness;
     }
 
-    println!("✓ Self-send signed (YES & NO multisig)");
+    println!("✓ Leaf 3 spend signed (YES & NO cooperative, no OP_IF)");
     let self_send_txid = broadcast_tx(&self_send_tx)?;
 
-    // ═══ STEP 6: SECOND FUNDING - NO TIMELOCK PATH ═══
+    // ═══ STEP 6: SECOND FUNDING - LEAF 1 PATH B (NO TIMELOCK) ═══
     println!("\n═══════════════════════════════════════════════════════");
-    println!("Step 6: Second funding round for NO timelock path");
+    println!("Step 6: Second funding - Leaf 1 Path B (NO + timelock)");
     println!("═══════════════════════════════════════════════════════");
 
     println!("\nRequesting more faucet funds for second round...");
@@ -675,9 +731,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nWaiting for contract UTXO...");
     thread::sleep(Duration::from_secs(10));
 
-    // ═══ NO TIMELOCK SPEND (Leaf 1 Path B) ═══
-    println!("\n--- Leaf 1, Path B: NO Timelock Spend ---");
+    // ═══ SPEND FROM LEAF 1 PATH B (NO TIMELOCK) ═══
+    println!("\n--- Spending from Leaf 1, Path B: NO + Timelock ---");
     println!("Policy: and(pk(NO_ALT), after({}))", NO_SPEND_HEIGHT);
+    println!("Contains OP_IF - will be invalid if BIP 444 activates");
     println!("└─ Using: NO-only Signing Wallet");
 
     let mut no_timelock_tx = Transaction {
@@ -739,9 +796,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  TXID (ready): {}", no_timelock_tx.compute_txid());
     }
 
-    // ═══ STEP 7: THIRD FUNDING - YES TIMELOCK PATH ═══
+    // ═══ STEP 7: THIRD FUNDING - LEAF 2 (YES TIMELOCK) ═══
     println!("\n═══════════════════════════════════════════════════════");
-    println!("Step 7: Third funding round for YES timelock path");
+    println!("Step 7: Third funding - Leaf 2 (YES + timelock)");
     println!("═══════════════════════════════════════════════════════");
 
     println!("\nRequesting more faucet funds for third round...");
@@ -839,9 +896,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nWaiting for contract UTXO...");
     thread::sleep(Duration::from_secs(10));
 
-    // ═══ YES TIMELOCK SPEND (Leaf 2) ═══
-    println!("\n--- Leaf 2: YES Timelock Spend ---");
+    // ═══ SPEND FROM LEAF 2 (YES TIMELOCK) ═══
+    println!("\n--- Spending from Leaf 2: YES + Timelock ---");
     println!("Policy: and(pk(YES), after({}))", YES_SPEND_HEIGHT);
+    println!("No OP_IF - remains valid regardless of BIP 444");
     println!("└─ Using: YES-only Signing Wallet");
 
     let mut yes_timelock_tx = Transaction {
@@ -906,19 +964,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║              ✓ ALL STEPS COMPLETE                 ║");
     println!("╚════════════════════════════════════════════════════╝");
 
-    println!("\n═══ PATH A: MULTISIG ═══");
+    println!("\n═══ LEAF 3: REFRESH TRANSACTION (no OP_IF) ═══");
     println!("  TXID: {}", self_send_txid);
+    println!("  Purpose: Bypass BIP 444 grandfather clause");
+    println!("  Creates fresh UTXO subject to BIP 444 rules");
+    println!("  Simple 2-of-2, remains valid regardless of BIP 444");
 
-    println!("\n═══ PATH B: NO TIMELOCK ═══");
+    println!("\n═══ LEAF 1 PATH B: NO TIMELOCK (contains OP_IF) ═══");
     println!("  Funding: {}", funding_txid2);
+    println!("  Contains OP_IF - INVALID if BIP 444 activates");
     println!("  Status: {}", if current_height >= NO_SPEND_HEIGHT {
         "Broadcast successful"
     } else {
         "Ready (locked until block height)"
     });
 
-    println!("\n═══ PATH C: YES TIMELOCK ═══");
+    println!("\n═══ LEAF 2: YES TIMELOCK (no OP_IF) ═══");
     println!("  Funding: {}", funding_txid3);
+    println!("  No OP_IF - remains valid regardless of BIP 444");
     println!("  Status: {}", if current_height2 >= YES_SPEND_HEIGHT {
         "Broadcast successful"
     } else {
@@ -928,6 +991,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nContract: {}", contract.address);
     println!("Current height: {} | NO unlock: {} | YES unlock: {}",
         current_height2, NO_SPEND_HEIGHT, YES_SPEND_HEIGHT);
+    println!("\n═══ ALL THREE SPENDING PATHS DEMONSTRATED ═══");
+    println!("✓ Leaf 3: Refresh transaction (bypasses grandfather clause)");
+    println!("✓ Leaf 1 Path B: NO + timelock (contains OP_IF, invalid if BIP 444 activates)");
+    println!("✓ Leaf 2: YES + timelock (no OP_IF, always valid)");
 
     Ok(())
 }
